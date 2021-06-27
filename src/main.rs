@@ -3,7 +3,8 @@ use hyper::service::{make_service_fn, service_fn};
 mod ssl;
 use core::task::{Context, Poll};
 use futures_util::stream::Stream;
-use hyper::{client, Body, Request, Response, Server,server::conn::AddrStream,};
+use hyper::{client, header::HeaderValue, Body, Request, Response, Server};
+
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{io, sync};
@@ -68,20 +69,23 @@ async fn run_server() -> Result<(), GenericError> {
   };
   let client: client::Client<_, hyper::Body> = hyper::client::Client::builder().build(https);
 
-  let new_service = make_service_fn(move |s: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>| {
-    // Move a clone of `client` into the `service_fn`.
-    let client = client.clone();
-    async {
-      Ok::<_, GenericError>(service_fn(move |req| {
-        // Clone again to ensure that client outlives this closure.
-        proxy(req, client.to_owned(),remote_addr)
-      }))
-    }
-  });
+  let new_service = make_service_fn(
+    |s: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>| {
+      let (tcp_stream, inner) = s.into_inner();
+      let sni_hostname = inner.get_sni_hostname();
+      let client = client.clone();
+      async {
+        Ok::<_, GenericError>(service_fn(move |req: Request<Body>| {
+          // Clone again to ensure that client outlives this closure.
+          proxy(req, client.to_owned(), tcp_stream.peer_addr().unwrap())
+        }))
+      }
+    },
+  );
 
   let server = Server::builder(HyperAcceptor {
     acceptor: Box::pin(incoming_tls_stream),
-  }).tcp_sleep_on_accept_errors(true)
+  })
   .serve(new_service);
   server.await?;
 
@@ -89,14 +93,12 @@ async fn run_server() -> Result<(), GenericError> {
 }
 struct HyperAcceptor<'a> {
   acceptor: Pin<Box<dyn Stream<Item = Result<TlsStream<TcpStream>, io::Error>> + 'a>>,
-  
 }
 
 impl hyper::server::accept::Accept for HyperAcceptor<'_> {
   type Conn = TlsStream<TcpStream>;
   type Error = io::Error;
 
-           
   fn poll_accept(
     mut self: Pin<&mut Self>,
     cx: &mut Context,
@@ -104,13 +106,12 @@ impl hyper::server::accept::Accept for HyperAcceptor<'_> {
     Pin::new(&mut self.acceptor).poll_next(cx)
   }
 }
+
 async fn proxy(
   req: Request<Body>,
   client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
-  remote_addr:std::net::SocketAddr
+  remote_addr: std::net::SocketAddr,
 ) -> Result<Response<Body>, GenericError> {
-  // First parameter is target URL (mandatory).
-
   // Prepare the HTTPS connector.
   let out_addr = "https://cloudflare.com";
 
@@ -126,13 +127,11 @@ async fn proxy(
   .to_owned();
   let (mut parts, body) = req.into_parts();
   parts.headers.remove("Host");
-  let forwarded_req = if let Some(addr) = req. {
-    forwarded_req.header("x-forwarded-for", format!("{}", addr.ip()))
-  } else {
-    forwarded_req
-  };
+  parts.headers.append(
+    "x-forwarded-for",
+    HeaderValue::from_str(&format!("{}", remote_addr)).unwrap(),
+  );
   let mut request: Request<Body> = Request::from_parts(parts, body);
-
   *request.uri_mut() = uri_string.parse().unwrap();
   let forward_res = client.request(request).await?;
   Ok(forward_res)

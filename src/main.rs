@@ -3,7 +3,7 @@ use hyper::service::{make_service_fn, service_fn};
 mod ssl;
 use core::task::{Context, Poll};
 use futures_util::stream::Stream;
-use http::HeaderValue;
+
 use hyper::{client, Body, Request, Response, Server};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,9 +20,6 @@ fn main() {
     println!("FAILED: {}", e);
   }
 }
-fn error(err: String) -> io::Error {
-  io::Error::new(io::ErrorKind::Other, err)
-}
 
 #[tokio::main]
 async fn run_server() -> Result<(), GenericError> {
@@ -30,7 +27,7 @@ async fn run_server() -> Result<(), GenericError> {
   let https = {
     // Build an HTTP connector which supports HTTPS too.
     let mut http = client::HttpConnector::new();
-    http.enforce_http(false);
+    http.enforce_http(true);
     let tls = rustls::ClientConfig::new();
 
     // Join the above part into an HTTPS connector.
@@ -69,28 +66,19 @@ async fn run_server() -> Result<(), GenericError> {
       }
   };
   let client: client::Client<_, hyper::Body> = hyper::client::Client::builder().build(https);
-
+  //let client = hyper::Client::new();
   let service = make_service_fn(
     move |s: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>| {
       let client = client.clone();
       let (tls_stream, server_session) = s.get_ref();
-      let a = tls_stream.peer_addr().unwrap();
+      let ip = tls_stream.peer_addr().unwrap();
+      let _ss = server_session
+        .get_sni_hostname()
+        .map(|name| name.to_string())
+        .unwrap();
       async move {
-        let asdf = a.clone();
-        Ok::<_, io::Error>(service_fn(move |req: Request<Body>| {
-          let (mut parts, body) = req.into_parts();
-          parts.headers.remove("host");
-          parts.headers.append(
-            "host",
-            http::HeaderValue::from_str(&format!("{}", parts.uri.authority().unwrap())).unwrap(),
-          );
-          parts.headers.remove("x-forwarded-for");
-          parts.headers.append(
-            "x-forwarded-for",
-            http::HeaderValue::from_str(&format!("{}", asdf)).unwrap(),
-          );
-          let request: Request<Body> = Request::from_parts(parts, body);
-          proxy(request, client.to_owned())
+        Ok::<_, GenericError>(service_fn(move |req: Request<Body>| {
+          handle(req, ip, client.to_owned())
         }))
       }
     },
@@ -120,8 +108,9 @@ impl hyper::server::accept::Accept for HyperAcceptor<'_> {
   }
 }
 
+//<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>> hyper::Client<hyper::client::HttpConnector>,
 async fn proxy(
-  req: Request<Body>,
+  mut req: Request<Body>,
   client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
 ) -> Result<Response<Body>, GenericError> {
   // Prepare the HTTPS connector.
@@ -137,14 +126,42 @@ async fn proxy(
       .unwrap_or("/")
   )
   .to_owned();
+  *req.version_mut() = hyper::Version::HTTP_11;
+  *req.uri_mut() = uri_string.parse()?;
+  let forward_res = client.request(req).await.unwrap();
+  // let (parts, body) = forward_res.into_parts();
+  //let body = hyper::body::to_bytes(body).await.unwrap().to_vec();
+  //let final_res = Response::from_parts(parts, hyper::Body::from(body));
+  Ok(forward_res)
+}
+
+async fn handle(
+  req: Request<Body>,
+  ip: std::net::SocketAddr,
+  client: hyper::Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+) -> Result<Response<Body>, GenericError> {
+  println!("{:?}", req.headers().get("Host"));
+  if None == req.headers().get("Host") && None == req.uri().authority() {
+    return Ok(error(req).await.unwrap());
+  }
   let (mut parts, body) = req.into_parts();
-  parts.headers.remove("host");
-  //   parts.headers.append(
-  // "x-forwarded-for",
-  //  HeaderValue::from_str(&format!("{}", remote_addr)).unwrap(),
-  // );
-  let mut request: Request<Body> = Request::from_parts(parts, body);
-  *request.uri_mut() = uri_string.parse().unwrap();
-  let forward_res = client.request(request);
-  Ok(forward_res.await.unwrap())
+  if parts.headers.get("Host") != None && parts.uri.authority() != None {
+    parts.headers.insert(
+      "Host",
+      http::HeaderValue::from_str(&format!("{}", parts.uri.authority().unwrap())).unwrap(),
+    );
+  }
+  parts.headers.insert(
+    "x-forwarded-for",
+    http::HeaderValue::from_str(&format!("{}", ip)).unwrap(),
+  );
+  Ok(
+    proxy(Request::from_parts(parts, body), client.to_owned())
+      .await
+      .unwrap(),
+  )
+}
+
+async fn error(_req: Request<Body>) -> Result<Response<Body>, GenericError> {
+  Ok(Response::new("you are missing the ratio header".into()))
 }

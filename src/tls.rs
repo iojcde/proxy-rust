@@ -114,7 +114,7 @@ pub async fn bind_tls(
     cfg.set_protocols(&[b"h2".to_vec(), b"http/1.1".to_vec()]);
     cfg
   };
-
+  
   let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
   let state = TlsListenerState::Listening;
 
